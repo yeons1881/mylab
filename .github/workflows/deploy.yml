@@ -1,0 +1,71 @@
+name: Infra Lifecycle Manager
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Action to perform'
+        required: true
+        default: 'apply'
+        type: choice
+        options:
+          - apply
+          - destroy
+
+jobs:
+  terraform:
+    runs-on: ubuntu-latest
+    outputs:
+      public_ip: ${{ steps.get_ip.outputs.ip }}
+      action: ${{ github.event.inputs.action || 'apply' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - name: Terraform Init
+        run: terraform -chdir=terraform init
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      - name: Terraform Action
+        run: |
+          if [ "${{ github.event.inputs.action || 'apply' }}" == "destroy" ]; then
+            terraform -chdir=terraform destroy -auto-approve
+          else
+            terraform -chdir=terraform apply -auto-approve
+          fi
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      - name: Get Public IP
+        id: get_ip
+        if: github.event.inputs.action != 'destroy'
+        run: echo "ip=$(terraform -chdir=terraform output -raw nginx_public_ip)" >> $GITHUB_OUTPUT
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+  ansible:
+    needs: terraform
+    if: needs.terraform.outputs.action != 'destroy'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create Inventory
+        run: |
+          echo "[webserver]" > inventory.ini
+          echo "${{ needs.terraform.outputs.public_ip }} ansible_user=ec2-user" >> inventory.ini
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+      - name: Wait for SSH
+        run: |
+          until ansible -i inventory.ini webserver -m ping -e "ansible_ssh_common_args='-o StrictHostKeyChecking=no'"; do
+            echo "Waiting for SSH..."
+            sleep 10
+          done
+      - name: Run Playbook
+        run: |
+          ansible-playbook -i inventory.ini ansible/playbook.yml \
+            -e "ansible_ssh_common_args='-o StrictHostKeyChecking=no'"
